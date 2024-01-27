@@ -9,12 +9,13 @@ package rapid
 import (
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 // Make creates a generator of values of type V, using reflection to infer the required structure.
 func Make[V any]() *Generator[V] {
 	var zero V
-	gen := newMakeGen(reflect.TypeOf(zero))
+	gen := newMakeGen(reflect.TypeOf(zero), nil)
 	return newGenerator[V](&makeGen[V]{
 		gen: gen,
 	})
@@ -33,8 +34,8 @@ func (g *makeGen[V]) value(t *T) V {
 	return g.gen.value(t).(V)
 }
 
-func newMakeGen(typ reflect.Type) *Generator[any] {
-	gen, mayNeedCast := newMakeKindGen(typ)
+func newMakeGen(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
+	gen, mayNeedCast := newMakeKindGen(typ, overrides)
 	if !mayNeedCast || typ.String() == typ.Kind().String() {
 		return gen // fast path with less reflect
 	}
@@ -55,7 +56,33 @@ func (g *castGen) value(t *T) any {
 	return reflect.ValueOf(v).Convert(g.typ).Interface()
 }
 
-func newMakeKindGen(typ reflect.Type) (gen *Generator[any], mayNeedCast bool) {
+func makeLinkName(t reflect.Type) string {
+	path := t.PkgPath()
+	name := t.Name()
+	if len(path) == 0 && len(name) == 0 {
+		return ""
+	}
+
+	if len(path) == 0 {
+		return name
+	}
+
+	return fmt.Sprintf("%s.%s", t.PkgPath(), t.Name())
+}
+
+func newMakeKindGen(typ reflect.Type, overrides []*Generator[any]) (gen *Generator[any], mayNeedCast bool) {
+	// First, check if any overrides apply
+	for _, override := range overrides {
+		// My kingdom for https://github.com/golang/go/issues/54393
+		tt := reflect.TypeOf(override.impl).Elem()
+
+		// Types that are parameterized generically expose "link name" (see https://github.com/golang/go/issues/55924)
+		target := fmt.Sprintf("[%s]", makeLinkName(typ))
+		if strings.Contains(tt.Name(), target) {
+			return override, false // TODO: No idea if false is right here
+		}
+	}
+
 	switch typ.Kind() {
 	case reflect.Bool:
 		return Bool().AsAny(), true
@@ -86,25 +113,25 @@ func newMakeKindGen(typ reflect.Type) (gen *Generator[any], mayNeedCast bool) {
 	case reflect.Float64:
 		return Float64().AsAny(), true
 	case reflect.Array:
-		return genAnyArray(typ), false
+		return genAnyArray(typ, overrides), false
 	case reflect.Map:
-		return genAnyMap(typ), false
+		return genAnyMap(typ, overrides), false
 	case reflect.Pointer:
-		return Deferred(func() *Generator[any] { return genAnyPointer(typ) }), false
+		return Deferred(func() *Generator[any] { return genAnyPointer(typ, overrides) }), false
 	case reflect.Slice:
-		return genAnySlice(typ), false
+		return genAnySlice(typ, overrides), false
 	case reflect.String:
 		return String().AsAny(), true
 	case reflect.Struct:
-		return genAnyStruct(typ), false
+		return genAnyStruct(typ, overrides), false
 	default:
 		panic(fmt.Sprintf("unsupported type kind for Make: %v", typ.Kind()))
 	}
 }
 
-func genAnyPointer(typ reflect.Type) *Generator[any] {
+func genAnyPointer(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
 	elem := typ.Elem()
-	elemGen := newMakeGen(elem)
+	elemGen := newMakeGen(elem, overrides)
 	const pNonNil = 0.5
 
 	return Custom[any](func(t *T) any {
@@ -119,9 +146,9 @@ func genAnyPointer(typ reflect.Type) *Generator[any] {
 	})
 }
 
-func genAnyArray(typ reflect.Type) *Generator[any] {
+func genAnyArray(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
 	count := typ.Len()
-	elemGen := newMakeGen(typ.Elem())
+	elemGen := newMakeGen(typ.Elem(), overrides)
 
 	return Custom[any](func(t *T) any {
 		a := reflect.Indirect(reflect.New(typ))
@@ -137,8 +164,8 @@ func genAnyArray(typ reflect.Type) *Generator[any] {
 	})
 }
 
-func genAnySlice(typ reflect.Type) *Generator[any] {
-	elemGen := newMakeGen(typ.Elem())
+func genAnySlice(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
+	elemGen := newMakeGen(typ.Elem(), overrides)
 
 	return Custom[any](func(t *T) any {
 		repeat := newRepeat(-1, -1, -1, elemGen.String())
@@ -151,9 +178,9 @@ func genAnySlice(typ reflect.Type) *Generator[any] {
 	})
 }
 
-func genAnyMap(typ reflect.Type) *Generator[any] {
-	keyGen := newMakeGen(typ.Key())
-	valGen := newMakeGen(typ.Elem())
+func genAnyMap(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
+	keyGen := newMakeGen(typ.Key(), overrides)
+	valGen := newMakeGen(typ.Elem(), overrides)
 
 	return Custom[any](func(t *T) any {
 		label := keyGen.String() + "," + valGen.String()
@@ -172,11 +199,11 @@ func genAnyMap(typ reflect.Type) *Generator[any] {
 	})
 }
 
-func genAnyStruct(typ reflect.Type) *Generator[any] {
+func genAnyStruct(typ reflect.Type, overrides []*Generator[any]) *Generator[any] {
 	numFields := typ.NumField()
 	fieldGens := make([]*Generator[any], numFields)
 	for i := 0; i < numFields; i++ {
-		fieldGens[i] = newMakeGen(typ.Field(i).Type)
+		fieldGens[i] = newMakeGen(typ.Field(i).Type, overrides)
 	}
 
 	return Custom[any](func(t *T) any {
